@@ -1,0 +1,99 @@
+"""Environment driven configuration.
+
+Every knob the backend exposes lives here so the rest of the code never has to
+read ``os.environ`` directly. Values come from a ``.env`` file next to the
+``backend`` folder (see ``.env.example``) plus the real environment, with the
+real environment winning - that keeps container/CI overrides working.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+# Load .env without clobbering anything already set in the environment.
+load_dotenv(BACKEND_DIR / ".env", override=False)
+
+
+def _str(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
+
+
+def _int(name: str, default: int) -> int:
+    raw = _str(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _float(name: str, default: float) -> float:
+    raw = _str(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = _str(name)
+    if not raw:
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _path(name: str, default: str) -> Path:
+    raw = _str(name) or default
+    path = Path(raw)
+    return path if path.is_absolute() else (BACKEND_DIR / path)
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Immutable snapshot of the runtime configuration."""
+
+    gemini_api_key: str = field(default_factory=lambda: _str("GEMINI_API_KEY"))
+    gemini_model: str = field(
+        default_factory=lambda: _str("GEMINI_MODEL", "gemini-3.8-flash")
+    )
+    gemini_thinking_level: str = field(
+        default_factory=lambda: _str("GEMINI_THINKING_LEVEL", "low").lower()
+    )
+    gemini_max_output_tokens: int = field(
+        default_factory=lambda: _int("GEMINI_MAX_OUTPUT_TOKENS", 1024)
+    )
+    chat_history_limit: int = field(
+        default_factory=lambda: _int("CHAT_HISTORY_LIMIT", 24)
+    )
+    database_path: Path = field(
+        default_factory=lambda: _path("DATABASE_PATH", "data/hearth.db")
+    )
+    cors_origins: tuple[str, ...] = field(
+        default_factory=lambda: _csv(
+            "CORS_ORIGINS",
+            ("http://localhost:5173", "http://127.0.0.1:5173"),
+        )
+    )
+    host: str = field(default_factory=lambda: _str("HOST", "127.0.0.1"))
+    port: int = field(default_factory=lambda: _int("PORT", 8000))
+
+    @property
+    def llm_configured(self) -> bool:
+        """True when a Gemini API key is present, i.e. real replies are on."""
+        return bool(self.gemini_api_key)
+
+    @property
+    def llm_mode(self) -> str:
+        return "gemini" if self.llm_configured else "demo"
+
+
+settings = Settings()

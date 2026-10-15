@@ -1,0 +1,5 @@
+fastapi>=0.118
+uvicorn[standard]>=0.37
+httpx>=0.28
+python-dotenv>=1.1
+websockets>=15.0
