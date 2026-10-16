@@ -15,12 +15,17 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import uuid
 
 import httpx
 import websockets
 
 TIMEOUT = 30.0
 ok = True
+
+# The script signs in as a throwaway account so it never touches your own data.
+ACCOUNT_EMAIL = "live-check@hearth.local"
+ACCOUNT_PASSWORD = "live-check-password"
 
 
 def report(label: str, value: str) -> None:
@@ -33,12 +38,35 @@ def check(condition: bool, label: str) -> None:
     print(f"  [{'PASS' if condition else 'FAIL'}] {label}")
 
 
+async def authenticate(client: httpx.AsyncClient) -> str:
+    """Sign in (or create) the throwaway account and return a bearer token."""
+    credentials = {"email": ACCOUNT_EMAIL, "password": ACCOUNT_PASSWORD}
+    response = await client.post(
+        "/api/auth/signup",
+        json={**credentials, "username": f"LiveCheck-{uuid.uuid4().hex[:4]}"},
+    )
+    if response.status_code == 409:
+        response = await client.post("/api/auth/login", json=credentials)
+    check(response.status_code in (200, 201), "account sign-in")
+    return response.json()["token"]
+
+
 async def main(base_url: str) -> int:
     print(f"\nHearth live check -> {base_url}\n")
 
     async with httpx.AsyncClient(base_url=base_url, timeout=TIMEOUT) as client:
+        # --- Accounts ------------------------------------------------------ #
+        print("Accounts")
+        token = await authenticate(client)
+        client.headers["Authorization"] = f"Bearer {token}"
+        me = (await client.get("/api/auth/me")).json()["user"]
+        report("signed in", me["email"])
+        report("plan", "unlimited (BYOK)" if me["has_gemini_key"] else "shared key")
+        anon = await client.get("/api/auth/me", headers={"Authorization": ""})
+        check(anon.status_code == 401, "protected routes reject a missing token")
+
         # --- REST ---------------------------------------------------------- #
-        print("REST")
+        print("\nREST")
         health = (await client.get("/api/health")).json()
         report("health", health["status"])
         report("llm mode", f"{health['llm']['mode']} ({health['llm']['model']})")
@@ -59,7 +87,8 @@ async def main(base_url: str) -> int:
             # --- WebSocket ------------------------------------------------- #
             print("\nWebSocket")
             url = base_url.replace("https://", "wss://").replace("http://", "ws://")
-            async with websockets.connect(f"{url}/ws/chat/{agent['id']}") as socket:
+            socket_url = f"{url}/ws/chat/{agent['id']}?token={token}"
+            async with websockets.connect(socket_url) as socket:
                 ready = json.loads(await asyncio.wait_for(socket.recv(), TIMEOUT))
                 check(ready["type"] == "ready", "ready frame received")
 
@@ -68,8 +97,12 @@ async def main(base_url: str) -> int:
                 echo = json.loads(await asyncio.wait_for(socket.recv(), TIMEOUT))
                 check(echo["type"] == "user_message", "user message persisted and echoed")
 
-                first = json.loads(await asyncio.wait_for(socket.recv(), TIMEOUT))
-                check(first["type"] == "assistant_start", "streaming started")
+                # Shared-key users get a quota frame after each accepted turn.
+                event = json.loads(await asyncio.wait_for(socket.recv(), TIMEOUT))
+                if event["type"] == "quota":
+                    report("quota", f"{event['quota']['messages_used_today']}/{event['quota']['messages_limit']}")
+                    event = json.loads(await asyncio.wait_for(socket.recv(), TIMEOUT))
+                check(event["type"] == "assistant_start", "streaming started")
 
                 chunks: list[str] = []
                 final = None

@@ -81,18 +81,20 @@ are screen-reader named and get a native tooltip for free.
 
 ```
 src/
-├─ App.jsx                    State owner: data loading, socket wiring, dialogs
+├─ App.jsx                    State owner: session, data loading, socket wiring, dialogs
 ├─ main.jsx                   Entry point
 ├─ styles.css                 Tokens, layout, all component styles
 ├─ lib/
-│  ├─ api.js                  REST client + websocket URL builder
+│  ├─ api.js                  REST client (bearer auth) + websocket URL builder
 │  ├─ useChatSocket.js        Socket lifecycle, reconnect/backoff, send guards
 │  ├─ hooks.js                usePersistentState, useStreamBuffer (rAF batching)
 │  ├─ accents.js              Warm accent map, tint styles, initials
 │  ├─ time.js                 relativeTime, clockTime, dayLabel, previewText
 │  └─ cx.js                   Class-name joiner
 └─ components/
-   ├─ Sidebar.jsx             Brand, new button, search, companion list, theme switch
+   ├─ AuthScreen.jsx          Full-screen sign-in / create-account gate
+   ├─ AccountDialog.jsx       Username, Gemini key, password, quota, sign out
+   ├─ Sidebar.jsx             Brand, new button, search, companion list, account chip, theme switch
    ├─ ChatHeader.jsx          Avatar, status, overflow menu
    ├─ MessageList.jsx         Day separators, grouping, autoscroll, streaming row
    ├─ Composer.jsx            Auto-growing input, Enter/Shift+Enter, stop button
@@ -104,6 +106,20 @@ src/
    ├─ ui.jsx                  IconButton, Notice, StatusDot
    └─ personaIcons.js         Archetype → lucide icon
 ```
+
+### Accounts and the session token
+
+The app boots into `AuthScreen` until a session exists. `lib/api.js` keeps the
+bearer token in `localStorage` (`hearth.token`) and attaches it to every REST
+call; `useChatSocket` appends it to the websocket URL, because a browser cannot
+set headers on a WebSocket handshake. A `401` from any call, or a `4401` close
+from the socket, drops the token and returns to the gate.
+
+`AccountDialog` (opened from the account chip in the sidebar footer) shows quota
+usage and lets the user save their **own** Gemini key. The server never returns
+the key, so the field always starts empty; "Remove key" sends an empty string to
+fall back to the shared limits. A dismissible banner nudges shared-key users to
+add a key, and quota errors open the dialog directly.
 
 ### Notable behaviours
 
@@ -179,6 +195,9 @@ npm test
 
 - **Render** - the real React tree through `react-dom/server` under jsdom, which
   catches broken imports, hook misuse and JSX mistakes a build alone would miss.
+- **Auth surface** - the sign-in gate renders for an unauthenticated app, the
+  account dialog shows usage and the BYOK state, and the token round-trips onto
+  the websocket URL.
 - **Layout guard** - parses `styles.css` into rules and asserts the scrolling
   invariants above: every scroll region declares `overflow-y`, the full-height
   panes never use `place-items`, the columns declare `min-height: 0`, fixed

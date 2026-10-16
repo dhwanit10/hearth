@@ -4,16 +4,40 @@
  * By default every call goes to the same origin, which the Vite dev server
  * proxies to FastAPI (see vite.config.js). Set VITE_API_BASE to point the UI at
  * a backend on another host.
+ *
+ * The session token is kept in localStorage and attached as a bearer header on
+ * every request; the websocket carries it in the query string instead, because
+ * browsers cannot set headers on a WebSocket handshake.
  */
 
 const API_BASE = (import.meta.env?.VITE_API_BASE ?? "").replace(/\/+$/, "");
 const WS_BASE = (import.meta.env?.VITE_WS_BASE ?? "").replace(/\/+$/, "");
 
+const TOKEN_KEY = "hearth.token";
+
+export function getToken() {
+  try {
+    return window.localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setToken(token) {
+  try {
+    if (token) window.localStorage.setItem(TOKEN_KEY, token);
+    else window.localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* storage unavailable - the session still works for this tab */
+  }
+}
+
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, code = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -29,16 +53,30 @@ function describeDetail(detail, fallback) {
       })
       .join(", ");
   }
+  // Structured errors from the quota layer: { code, message }.
+  if (typeof detail === "object" && detail.message) return detail.message;
   return fallback;
 }
 
-async function request(path, { method = "GET", body, signal } = {}) {
+function errorCode(detail) {
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    return detail.code ?? null;
+  }
+  return null;
+}
+
+async function request(path, { method = "GET", body, signal, token } = {}) {
+  const authToken = token ?? getToken();
+  const headers = {};
+  if (body) headers["Content-Type"] = "application/json";
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+
   let response;
   try {
     response = await fetch(`${API_BASE}${path}`, {
       method,
       signal,
-      headers: body ? { "Content-Type": "application/json" } : undefined,
+      headers: Object.keys(headers).length ? headers : undefined,
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch (error) {
@@ -60,6 +98,7 @@ async function request(path, { method = "GET", body, signal } = {}) {
     throw new ApiError(
       describeDetail(detail, `Request failed (${response.status}).`),
       response.status,
+      errorCode(detail),
     );
   }
 
@@ -67,11 +106,15 @@ async function request(path, { method = "GET", body, signal } = {}) {
   return response.json();
 }
 
-/** Websocket URL for a companion's live chat channel. */
-export function chatSocketUrl(agentId) {
-  if (WS_BASE) return `${WS_BASE}/ws/chat/${encodeURIComponent(agentId)}`;
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/ws/chat/${encodeURIComponent(agentId)}`;
+/** Websocket URL for a companion's live chat channel, carrying the token. */
+export function chatSocketUrl(agentId, token) {
+  const base = WS_BASE
+    ? `${WS_BASE}/ws/chat/${encodeURIComponent(agentId)}`
+    : `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${
+        window.location.host
+      }/ws/chat/${encodeURIComponent(agentId)}`;
+  const authToken = token ?? getToken();
+  return authToken ? `${base}?token=${encodeURIComponent(authToken)}` : base;
 }
 
 export const api = {
@@ -79,6 +122,21 @@ export const api = {
 
   personas: (signal) => request("/api/personas", { signal }),
 
+  // --- Accounts ---------------------------------------------------------- //
+  signup: (payload, signal) =>
+    request("/api/auth/signup", { method: "POST", body: payload, signal }),
+
+  login: (payload, signal) =>
+    request("/api/auth/login", { method: "POST", body: payload, signal }),
+
+  logout: () => request("/api/auth/logout", { method: "POST" }),
+
+  me: (signal) => request("/api/auth/me", { signal }),
+
+  updateMe: (payload, signal) =>
+    request("/api/auth/me", { method: "PATCH", body: payload, signal }),
+
+  // --- Companions -------------------------------------------------------- //
   nameSuggestions: (personaId, count = 3, signal) =>
     request(`/api/personas/${personaId}/names?count=${count}`, { signal }),
 

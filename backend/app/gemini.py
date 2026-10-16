@@ -62,15 +62,24 @@ class GeminiClient:
         api_key: str,
         model: str = "gemini-3.8-flash",
         *,
+        fallback_model: str = "",
         thinking_level: str = "",
         max_output_tokens: int = 1024,
         timeout: float = 120.0,
     ) -> None:
         self.api_key = api_key
         self.model = model
+        self.fallback_model = (fallback_model or "").strip()
         self.thinking_level = (thinking_level or "").lower()
         self.max_output_tokens = max_output_tokens
         self.timeout = timeout
+
+    def _models(self) -> list[str]:
+        """The primary model, then the fallback if one is configured."""
+        models = [self.model]
+        if self.fallback_model and self.fallback_model != self.model:
+            models.append(self.fallback_model)
+        return models
 
     # -- payload shaping ---------------------------------------------------- #
 
@@ -111,9 +120,10 @@ class GeminiClient:
 
     async def _stream_once(
         self,
+        model: str,
         payload: dict,
     ) -> AsyncIterator[str]:
-        url = GEMINI_ENDPOINT.format(model=self.model)
+        url = GEMINI_ENDPOINT.format(model=model)
         headers = {
             "x-goog-api-key": self.api_key,
             "Content-Type": "application/json",
@@ -128,7 +138,7 @@ class GeminiClient:
                 if response.status_code != 200:
                     body = (await response.aread()).decode("utf-8", "replace")
                     raise LLMError(
-                        self._describe_error(response.status_code, body),
+                        self._describe_error(response.status_code, body, model),
                         status_code=response.status_code,
                     )
 
@@ -168,21 +178,22 @@ class GeminiClient:
                         f"({blocked}). Try rephrasing it."
                     )
 
-    async def stream_reply(
+    async def _stream_model(
         self,
+        model: str,
         *,
         system_prompt: str,
         history: Sequence[tuple[str, str]],
-        temperature: float = 0.9,
+        temperature: float,
     ) -> AsyncIterator[str]:
-        """Yield reply chunks. Falls back once if thinking config is rejected."""
+        """Stream from a single model. Retries once without thinkingConfig on 400."""
         wants_thinking = self.thinking_level in VALID_THINKING_LEVELS
         payload = self._payload(
             system_prompt, history, temperature, include_thinking=wants_thinking
         )
         produced = False
         try:
-            async for piece in self._stream_once(payload):
+            async for piece in self._stream_once(model, payload):
                 produced = True
                 yield piece
             return
@@ -193,17 +204,65 @@ class GeminiClient:
             if produced or exc.status_code != 400 or not wants_thinking:
                 raise
             logger.warning(
-                "Model %s rejected thinkingConfig, retrying without it.", self.model
+                "Model %s rejected thinkingConfig, retrying without it.", model
             )
 
         plain_payload = self._payload(
             system_prompt, history, temperature, include_thinking=False
         )
-        async for piece in self._stream_once(plain_payload):
+        async for piece in self._stream_once(model, plain_payload):
             yield piece
 
     @staticmethod
-    def _describe_error(status_code: int, body: str) -> str:
+    def _is_fallback_worthy(exc: LLMError) -> bool:
+        """Whether another model could plausibly do better.
+
+        Model-specific and transient provider failures (unknown model, bad
+        request, rate limit, upstream 5xx) are worth retrying on the fallback.
+        A rejected key, or a reply the model declined to produce, is not.
+        """
+        code = exc.status_code
+        return code is not None and (code in (400, 404, 429) or code >= 500)
+
+    async def stream_reply(
+        self,
+        *,
+        system_prompt: str,
+        history: Sequence[tuple[str, str]],
+        temperature: float = 0.9,
+    ) -> AsyncIterator[str]:
+        """Yield reply chunks, falling back to the secondary model on failure.
+
+        The primary model is tried first; if it fails before emitting anything and
+        the error looks model-specific or transient, the fallback model is tried
+        once. Content that streams before a failure is never discarded.
+        """
+        models = self._models()
+        for index, model in enumerate(models):
+            produced = False
+            try:
+                async for piece in self._stream_model(
+                    model,
+                    system_prompt=system_prompt,
+                    history=history,
+                    temperature=temperature,
+                ):
+                    produced = True
+                    yield piece
+                return
+            except LLMError as exc:
+                is_last = index == len(models) - 1
+                if produced or is_last or not self._is_fallback_worthy(exc):
+                    raise
+                logger.warning(
+                    "Model %s failed (%s); falling back to %s.",
+                    model,
+                    exc.message,
+                    models[index + 1],
+                )
+
+    @staticmethod
+    def _describe_error(status_code: int, body: str, model: str) -> str:
         detail = ""
         try:
             parsed = json.loads(body)
@@ -215,8 +274,8 @@ class GeminiClient:
             hint = "The Gemini API key was rejected. Check GEMINI_API_KEY in backend/.env."
         elif status_code == 404:
             hint = (
-                f"The model does not exist for this API version. Check GEMINI_MODEL "
-                f"(currently '{settings.gemini_model}')."
+                f"The model '{model}' does not exist for this API version. Check "
+                f"GEMINI_MODEL / GEMINI_FALLBACK_MODEL."
             )
         elif status_code == 429:
             hint = "Gemini rate limit hit. Wait a moment and send again."
@@ -314,12 +373,18 @@ def _split_for_stream(text: str) -> Iterable[str]:
 _demo_engine = DemoEngine()
 
 
-def get_engine():
-    """Return the configured engine. Real Gemini wins when a key exists."""
-    if settings.llm_configured:
+def get_engine(api_key: str | None = None):
+    """Return the engine for one request.
+
+    A user-supplied (BYOK) key wins; otherwise the platform ``GEMINI_API_KEY``
+    is used; with neither, replies come from the offline demo engine.
+    """
+    key = (api_key or "").strip() or settings.gemini_api_key
+    if key:
         return GeminiClient(
-            settings.gemini_api_key,
+            key,
             settings.gemini_model,
+            fallback_model=settings.gemini_fallback_model,
             thinking_level=settings.gemini_thinking_level,
             max_output_tokens=settings.gemini_max_output_tokens,
         )
@@ -332,13 +397,16 @@ def llm_status() -> dict:
         return {
             "mode": "gemini",
             "configured": True,
+            "platformKey": True,
             "model": settings.gemini_model,
+            "fallbackModel": settings.gemini_fallback_model or None,
             "thinkingLevel": settings.gemini_thinking_level or "default",
             "notice": None,
         }
     return {
         "mode": "demo",
         "configured": False,
+        "platformKey": False,
         "model": "offline-demo-engine",
         "thinkingLevel": None,
         "notice": _DEMO_NOTICE,
@@ -351,9 +419,14 @@ async def stream_reply(
     history: Sequence[tuple[str, str]],
     temperature: float,
     persona: str,
+    api_key: str | None = None,
 ) -> AsyncIterator[str]:
-    """Single entry point used by the websocket layer."""
-    engine = get_engine()
+    """Single entry point used by the websocket layer.
+
+    ``api_key`` is the user's own Gemini key when they have supplied one; it
+    takes precedence over the platform key.
+    """
+    engine = get_engine(api_key)
     if isinstance(engine, DemoEngine):
         async for piece in engine.stream_reply(
             system_prompt=system_prompt,

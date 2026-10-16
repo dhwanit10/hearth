@@ -20,8 +20,35 @@ from typing import Any, Iterable, Sequence
 from .config import settings
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id             TEXT PRIMARY KEY,
+    email          TEXT NOT NULL UNIQUE,
+    username       TEXT NOT NULL,
+    password_hash  TEXT NOT NULL,
+    gemini_api_key TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id);
+
+CREATE TABLE IF NOT EXISTS usage_daily (
+    user_id  TEXT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day      TEXT    NOT NULL,
+    messages INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+);
+
 CREATE TABLE IF NOT EXISTS agents (
     id            TEXT PRIMARY KEY,
+    user_id       TEXT REFERENCES users(id) ON DELETE CASCADE,
     name          TEXT    NOT NULL,
     persona       TEXT    NOT NULL,
     tagline       TEXT    NOT NULL DEFAULT '',
@@ -32,6 +59,8 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at    TEXT    NOT NULL,
     updated_at    TEXT    NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_agents_user_id ON agents (user_id);
 
 CREATE TABLE IF NOT EXISTS messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,6 +75,12 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_agent_id ON messages (agent_id, id);
 """
 
+# Columns added after the first release; ``init_db`` patches old databases so
+# ``CREATE TABLE IF NOT EXISTS`` alone never leaves a table half-upgraded.
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("agents", "user_id", "ALTER TABLE agents ADD COLUMN user_id TEXT"),
+)
+
 # Columns the API is allowed to patch, guarding against dynamic SQL injection.
 AGENT_COLUMNS = frozenset(
     {"name", "persona", "tagline", "system_prompt", "custom_prompt",
@@ -54,8 +89,18 @@ AGENT_COLUMNS = frozenset(
 
 
 def utcnow() -> str:
-    """Current UTC time as a stable, sortable, JSON friendly string."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    """Current UTC time as a stable, sortable, JSON friendly string.
+
+    Microsecond precision keeps activity ordering deterministic when several
+    rows are written within the same second (e.g. two companions created, then
+    a message sent, all back to back).
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def today() -> str:
+    """Current UTC day as ``YYYY-MM-DD``; the bucket used for daily quotas."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def new_id() -> str:
@@ -77,7 +122,168 @@ def init_db() -> None:
     settings.database_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(get_connection()) as conn:
         conn.executescript(SCHEMA)
+        for table, column, ddl in MIGRATIONS:
+            existing = {
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                conn.execute(ddl)
         conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Users
+# --------------------------------------------------------------------------- #
+
+# Columns the API is allowed to patch directly.
+USER_COLUMNS = frozenset({"username", "gemini_api_key", "password_hash"})
+
+
+def count_users() -> int:
+    with closing(get_connection()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()
+    return int(row["total"]) if row else 0
+
+
+def create_user(
+    *,
+    email: str,
+    username: str,
+    password_hash: str,
+    gemini_api_key: str = "",
+) -> dict[str, Any]:
+    user_id = new_id()
+    now = utcnow()
+    with closing(get_connection()) as conn:
+        conn.execute(
+            """INSERT INTO users (id, email, username, password_hash,
+                                  gemini_api_key, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, email.strip().lower(), username.strip(), password_hash,
+             (gemini_api_key or "").strip(), now, now),
+        )
+        conn.commit()
+    created = get_user(user_id)
+    assert created is not None  # just inserted
+    return created
+
+
+def get_user(user_id: str) -> dict[str, Any] | None:
+    with closing(get_connection()) as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_by_email(email: str) -> dict[str, Any] | None:
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE email = ?", (email.strip().lower(),)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_user(user_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
+    fields = {k: v for k, v in changes.items() if k in USER_COLUMNS}
+    if not fields:
+        return get_user(user_id)
+    fields["updated_at"] = utcnow()
+    assignments = ", ".join(f"{column} = ?" for column in fields)
+    with closing(get_connection()) as conn:
+        cur = conn.execute(
+            f"UPDATE users SET {assignments} WHERE id = ?",
+            (*fields.values(), user_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return None
+    return get_user(user_id)
+
+
+def claim_unowned_agents(user_id: str) -> int:
+    """Give companions created before accounts existed to ``user_id``.
+
+    Called once, for the very first account, so pre-login data is not orphaned.
+    """
+    with closing(get_connection()) as conn:
+        cur = conn.execute(
+            "UPDATE agents SET user_id = ? WHERE user_id IS NULL", (user_id,)
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+# --------------------------------------------------------------------------- #
+# Sessions (opaque bearer tokens)
+# --------------------------------------------------------------------------- #
+
+
+def create_session(
+    *, token: str, user_id: str, created_at: str, expires_at: str
+) -> None:
+    with closing(get_connection()) as conn:
+        conn.execute(
+            """INSERT INTO sessions (token, user_id, created_at, expires_at)
+               VALUES (?, ?, ?, ?)""",
+            (token, user_id, created_at, expires_at),
+        )
+        conn.commit()
+
+
+def get_session(token: str) -> dict[str, Any] | None:
+    """Return the session row when it exists and has not expired."""
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE token = ?", (token,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["expires_at"] <= utcnow():
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
+            return None
+    return dict(row)
+
+
+def delete_session(token: str) -> bool:
+    with closing(get_connection()) as conn:
+        cur = conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# Daily usage (quota accounting for shared-key users)
+# --------------------------------------------------------------------------- #
+
+
+def daily_message_count(user_id: str, day: str | None = None) -> int:
+    bucket = day or today()
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT messages FROM usage_daily WHERE user_id = ? AND day = ?",
+            (user_id, bucket),
+        ).fetchone()
+    return int(row["messages"]) if row else 0
+
+
+def record_daily_message(user_id: str, day: str | None = None) -> int:
+    """Increment today's user-message counter and return the new total."""
+    bucket = day or today()
+    with closing(get_connection()) as conn:
+        conn.execute(
+            """INSERT INTO usage_daily (user_id, day, messages)
+               VALUES (?, ?, 1)
+               ON CONFLICT(user_id, day)
+               DO UPDATE SET messages = messages + 1""",
+            (user_id, bucket),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT messages FROM usage_daily WHERE user_id = ? AND day = ?",
+            (user_id, bucket),
+        ).fetchone()
+    return int(row["messages"]) if row else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -94,6 +300,7 @@ SELECT
     (SELECT m.created_at FROM messages m WHERE m.agent_id = a.id
      ORDER BY m.id DESC LIMIT 1)                                   AS last_message_at
 FROM agents a
+WHERE a.user_id = ?
 ORDER BY COALESCE(last_message_at, a.created_at) DESC, a.created_at DESC
 """
 
@@ -102,13 +309,21 @@ def _agent_row(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row)
 
 
-def list_agents() -> list[dict[str, Any]]:
+def list_agents(user_id: str) -> list[dict[str, Any]]:
     with closing(get_connection()) as conn:
-        rows = conn.execute(_LIST_AGENTS_SQL).fetchall()
+        rows = conn.execute(_LIST_AGENTS_SQL, (user_id,)).fetchall()
     return [_agent_row(row) for row in rows]
 
 
-def get_agent(agent_id: str) -> dict[str, Any] | None:
+def count_user_agents(user_id: str) -> int:
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total FROM agents WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return int(row["total"]) if row else 0
+
+
+def get_agent(agent_id: str, user_id: str | None = None) -> dict[str, Any] | None:
     with closing(get_connection()) as conn:
         row = conn.execute(
             "SELECT * FROM agents WHERE id = ?", (agent_id,)
@@ -116,6 +331,8 @@ def get_agent(agent_id: str) -> dict[str, Any] | None:
         if row is None:
             return None
         agent = dict(row)
+        if user_id is not None and agent.get("user_id") != user_id:
+            return None
         stats = conn.execute(
             """SELECT COUNT(*) AS message_count,
                       (SELECT content FROM messages WHERE agent_id = ?
@@ -138,17 +355,18 @@ def create_agent(
     custom_prompt: str = "",
     accent: str = "clay",
     temperature: float = 0.85,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     agent_id = new_id()
     now = utcnow()
     with closing(get_connection()) as conn:
         conn.execute(
-            """INSERT INTO agents (id, name, persona, tagline, system_prompt,
-                                   custom_prompt, accent, temperature,
-                                   created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (agent_id, name, persona, tagline, system_prompt, custom_prompt,
-             accent, float(temperature), now, now),
+            """INSERT INTO agents (id, user_id, name, persona, tagline,
+                                   system_prompt, custom_prompt, accent,
+                                   temperature, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (agent_id, user_id, name, persona, tagline, system_prompt,
+             custom_prompt, accent, float(temperature), now, now),
         )
         conn.commit()
     created = get_agent(agent_id)
@@ -180,9 +398,11 @@ def delete_agent(agent_id: str) -> bool:
         return cur.rowcount > 0
 
 
-def taken_names() -> set[str]:
+def taken_names(user_id: str) -> set[str]:
     with closing(get_connection()) as conn:
-        rows = conn.execute("SELECT name FROM agents").fetchall()
+        rows = conn.execute(
+            "SELECT name FROM agents WHERE user_id = ?", (user_id,)
+        ).fetchall()
     return {row["name"].casefold() for row in rows}
 
 
@@ -295,5 +515,5 @@ def agent_exists(agent_id: str) -> bool:
     return row is not None
 
 
-def iter_agents() -> Iterable[dict[str, Any]]:
-    yield from list_agents()
+def iter_agents(user_id: str) -> Iterable[dict[str, Any]]:
+    yield from list_agents(user_id)

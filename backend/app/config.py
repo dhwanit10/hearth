@@ -65,6 +65,9 @@ class Settings:
     gemini_model: str = field(
         default_factory=lambda: _str("GEMINI_MODEL", "gemini-3.8-flash")
     )
+    gemini_fallback_model: str = field(
+        default_factory=lambda: _str("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+    )
     gemini_thinking_level: str = field(
         default_factory=lambda: _str("GEMINI_THINKING_LEVEL", "low").lower()
     )
@@ -73,6 +76,19 @@ class Settings:
     )
     chat_history_limit: int = field(
         default_factory=lambda: _int("CHAT_HISTORY_LIMIT", 24)
+    )
+    # --- Accounts / BYOK quota --------------------------------------------- #
+    # Users who bring their own Gemini key get unlimited companions and
+    # messages. Everyone else rides on the platform key (``GEMINI_API_KEY``)
+    # and is capped at these numbers.
+    shared_key_max_agents: int = field(
+        default_factory=lambda: _int("SHARED_KEY_MAX_AGENTS", 3)
+    )
+    shared_key_daily_messages: int = field(
+        default_factory=lambda: _int("SHARED_KEY_DAILY_MESSAGES", 10)
+    )
+    session_ttl_days: int = field(
+        default_factory=lambda: _int("SESSION_TTL_DAYS", 30)
     )
     database_path: Path = field(
         default_factory=lambda: _path("DATABASE_PATH", "data/hearth.db")

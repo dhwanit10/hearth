@@ -1,5 +1,16 @@
 import { useMemo, useState } from "react";
-import { Flame, MessageSquare, Moon, Plus, Search, Sun, Trash2, X } from "lucide-react";
+import {
+  Flame,
+  KeyRound,
+  MessageSquare,
+  Moon,
+  Plus,
+  Search,
+  Sun,
+  Trash2,
+  UserRound,
+  X,
+} from "lucide-react";
 
 import { accentStyle } from "../lib/accents.js";
 import { cx } from "../lib/cx.js";
@@ -87,6 +98,8 @@ export default function Sidebar({
   onThemeChange,
   socketState,
   llm,
+  user,
+  onOpenAccount,
   onCloseDrawer,
 }) {
   const filtered = useMemo(() => {
@@ -189,7 +202,21 @@ export default function Sidebar({
       </div>
 
       <div className="sidebar__foot">
-        <div className="theme-toggle" role="group" aria-label="Colour theme">
+        <button type="button" className="account-chip" onClick={onOpenAccount}>
+          <span className="account-chip__avatar" aria-hidden="true">
+            <UserRound size={15} />
+          </span>
+          <span className="account-chip__body">
+            <span className="account-chip__name">{user?.username || "Account"}</span>
+            <span className="account-chip__meta">
+              {user?.has_gemini_key ? "Your own key" : "Shared key"}
+            </span>
+          </span>
+          <KeyRound size={14} className="account-chip__icon" aria-hidden="true" />
+        </button>
+
+        <div className="sidebar__foot-row">
+          <div className="theme-toggle" role="group" aria-label="Colour theme">
           <button
             type="button"
             className={cx("theme-toggle__option", theme === "light" && "is-active")}
@@ -224,6 +251,7 @@ export default function Sidebar({
               {llm?.model ? llm.model.replace(/^gemini-/, "") : "Gemini"}
             </span>
           )}
+        </div>
         </div>
       </div>
     </aside>

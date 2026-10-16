@@ -9,7 +9,7 @@ Warm, flat, and quiet by design: no shadows, no emoji, no blue.
 
 ```
 Hearth/
-├─ backend/     FastAPI + SQLite + Gemini, streaming replies over WebSockets
+├─ backend/     FastAPI + SQLite + Gemini, accounts + BYOK quota, streaming replies over WebSockets
 └─ frontend/    React + Vite, light and dark themes
 ```
 
@@ -17,6 +17,14 @@ Hearth/
 
 ## What it does
 
+- **Accounts, not a shared free-for-all.** Sign up with an email and password
+  (hashed with PBKDF2) and every companion, message and setting is scoped to
+  your account. Sessions are opaque bearer tokens; nothing else can see your
+  chats.
+- **Bring your own key.** Drop in your own Gemini API key in Settings and you
+  get unlimited companions and messages - your key, your quota. Riding on the
+  shared key instead caps you at 3 companions and 10 messages a day, and the UI
+  keeps nudging you to add your own.
 - **Companions, not assistants.** Five archetypes ship with hand-written
   personality prompts: `Best Friend` (sarcastic, roasts you, loyal underneath),
   `Girlfriend` (warm, flirty, notices your mood), `Teacher` (patient, checks you
@@ -72,18 +80,31 @@ notice so this is never ambiguous.
 Get a key at <https://aistudio.google.com/apikey>, put it in `backend/.env`, and
 restart. The UI pill switches from `Demo` to the model name.
 
+### The shared key vs. bring your own
+
+`GEMINI_API_KEY` in `backend/.env` is the **shared** platform key. Users who
+supply their own key in Settings ("BYOK") get unlimited companions and messages
+and none of your tokens are spent; everyone on the shared key is capped at 3
+companions and 10 messages per UTC day, and the UI prompts them to add their own
+key. Every account is separate: companions, history and settings are scoped to
+the signed-in user.
+
 ## How a reply is produced
 
 ```
-browser ──POST /api/agents──► FastAPI ──► SQLite
+browser ──POST /api/auth/login──► FastAPI ──► users / sessions (SQLite)
+   │                                   ▲
+   └──POST /api/agents (bearer token)──┘──► agents / messages (SQLite)
    │
-   └──ws /ws/chat/{id}──► Hub room ──► build context (last N messages)
-                              │
-                              ├─► Gemini streamGenerateContent (SSE)
-                              │      chunks ──► {"type":"delta"} ──► browser
-                              └─► save final message ──► SQLite
+   └──ws /ws/chat/{id}?token=…──► Hub room ──► build context (last N messages)
+                                      │
+                                      ├─► user key, else shared key, else demo
+                                      │      chunks ──► {"type":"delta"} ──► browser
+                                      └─► save final message ──► SQLite
 ```
 
+0. The client signs in and stores the bearer token; REST calls send it as an
+   `Authorization` header and the websocket carries it in the query string.
 1. The client sends `{"type": "message", "content": "..."}` over the socket.
 2. The user turn is written to SQLite **first**, then broadcast to every listener
    in that companion's room.
@@ -109,8 +130,8 @@ checks a flag between chunks, saves what it has, and marks the message `partial`
 Both halves ship with tests that run offline - no API key, no network:
 
 ```powershell
-cd backend  ; .\.venv\Scripts\python.exe -m pytest tests -q   # 16 passed
-cd frontend ; npm test                                       # 82 passed
+cd backend  ; .\.venv\Scripts\python.exe -m pytest tests -q   # 30 passed
+cd frontend ; npm test                                       # 108 passed
 ```
 
 The backend suite drives the real ASGI app (including a websocket round trip and
@@ -134,11 +155,15 @@ in each folder). The backend reads:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | *(empty)* | Empty means demo mode |
+| `GEMINI_API_KEY` | *(empty)* | Empty means demo mode; with users this is the shared platform key |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | Any Gemini model id |
+| `GEMINI_FALLBACK_MODEL` | `gemini-3.5-flash-lite` | Backup model tried once if the primary fails before streaming (empty disables) |
 | `GEMINI_THINKING_LEVEL` | `low` | `minimal`/`low`/`medium`/`high`, or empty for the model default |
 | `GEMINI_MAX_OUTPUT_TOKENS` | `1024` | Ceiling per reply |
 | `CHAT_HISTORY_LIMIT` | `24` | Messages of context replayed to the model |
+| `SHARED_KEY_MAX_AGENTS` | `3` | Companions a shared-key user may create |
+| `SHARED_KEY_DAILY_MESSAGES` | `10` | User messages a shared-key user may send per UTC day |
+| `SESSION_TTL_DAYS` | `30` | Login session lifetime |
 | `DATABASE_PATH` | `data/hearth.db` | SQLite file |
 | `CORS_ORIGINS` | `http://localhost:5173,...` | Allowed browser origins |
 
@@ -158,7 +183,8 @@ IPv6 on some Windows setups. Open <http://localhost:5173>, not the IPv4 address.
 
 **Gemini returns 404 for the model.** The model id in `GEMINI_MODEL` does not
 exist for the current API version. Model names change often; the error message
-names the model it tried.
+names the model it tried. If you set `GEMINI_FALLBACK_MODEL`, the backend retries
+once on it automatically before giving up.
 
 ## Notes
 

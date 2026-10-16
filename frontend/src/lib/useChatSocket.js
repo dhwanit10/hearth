@@ -12,16 +12,19 @@ export const SocketState = {
 const MAX_BACKOFF = 8000;
 // Server side close code for "this agent does not exist".
 const CLOSE_NOT_FOUND = 4404;
+// Server side close code for "your token is missing or expired".
+const CLOSE_UNAUTHORIZED = 4401;
 
 /**
  * Keeps one websocket open for the selected companion.
  *
  * - events are handed to the latest `onEvent` without re-opening the socket,
- * - drops are retried with exponential backoff (unless the agent is gone),
+ * - drops are retried with exponential backoff (unless the agent is gone or the
+ *   session expired),
  * - `send` reports whether the frame actually went out, so the UI can tell the
  *   user "reconnecting" instead of silently swallowing a message.
  */
-export function useChatSocket(agentId, onEvent) {
+export function useChatSocket(agentId, token, onEvent) {
   const handlerRef = useRef(onEvent);
   const socketRef = useRef(null);
   const attemptsRef = useRef(0);
@@ -47,7 +50,7 @@ export function useChatSocket(agentId, onEvent) {
 
       let socket;
       try {
-        socket = new WebSocket(chatSocketUrl(agentId));
+        socket = new WebSocket(chatSocketUrl(agentId, token));
       } catch {
         setState(SocketState.OFFLINE);
         return;
@@ -85,6 +88,16 @@ export function useChatSocket(agentId, onEvent) {
           return;
         }
 
+        if (event.code === CLOSE_UNAUTHORIZED) {
+          setState(SocketState.OFFLINE);
+          handlerRef.current?.({
+            type: "error",
+            code: "unauthorized",
+            message: "Your session has expired. Please sign in again.",
+          });
+          return;
+        }
+
         setState(SocketState.OFFLINE);
         const attempt = attemptsRef.current++;
         const delay = Math.min(400 * 2 ** attempt, MAX_BACKOFF);
@@ -106,7 +119,7 @@ export function useChatSocket(agentId, onEvent) {
         socket.close(1000, "switching companions");
       }
     };
-  }, [agentId]);
+  }, [agentId, token]);
 
   const send = useCallback((payload) => {
     const socket = socketRef.current;

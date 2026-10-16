@@ -1,5 +1,8 @@
 """Websocket hub: the live chat transport.
 
+Connect with a session token: ``/ws/chat/{agent_id}?token=<bearer>``. The token
+is validated before anything else and the companion must belong to that user.
+
 Protocol (JSON frames, all events carry ``agentId`` so a client can never
 mistake a message from another conversation for its own):
 
@@ -14,6 +17,7 @@ mistake a message from another conversation for its own):
         {"type": "assistant_start", message: {...placeholder} }
         {"type": "delta",           content: "..." }
         {"type": "assistant_end",   message: {...} , stopped: bool }
+        {"type": "quota",           quota: {...} }
         {"type": "error",           message: "...", code: "..." }
         {"type": "cancelled" }
 
@@ -27,6 +31,9 @@ Design notes
   end, so a dropped connection never leaves a half-written row behind.
 * "Stop" is cooperative (an ``asyncio.Event`` checked between chunks) rather
   than a task cancellation, which keeps the persistence path predictable.
+* Shared-key users are capped at ``SHARED_KEY_DAILY_MESSAGES`` messages per UTC
+  day; users who bring their own Gemini key are unlimited. The user's key, when
+  present, is the one used for the request.
 """
 
 from __future__ import annotations
@@ -39,7 +46,7 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from . import db
+from . import auth, db
 from .config import settings
 from .gemini import LLMError, stream_reply
 
@@ -49,6 +56,8 @@ router = APIRouter()
 
 # 4404 mirrors HTTP 404 so the frontend can tell "no such agent" from a drop.
 WS_NOT_FOUND = 4404
+# 4401 mirrors HTTP 401: the token was missing or expired.
+WS_UNAUTHORIZED = 4401
 
 
 @dataclass
@@ -128,7 +137,12 @@ hub = Hub()
 # --------------------------------------------------------------------------- #
 
 
-async def _generate(room: Room, agent: dict[str, Any], user_text: str) -> None:
+async def _generate(
+    room: Room,
+    agent: dict[str, Any],
+    user_text: str,
+    api_key: str | None = None,
+) -> None:
     """Stream one assistant reply for ``agent``, persisting it at the end."""
     agent_id = room.agent_id
     parts: list[str] = []
@@ -155,6 +169,7 @@ async def _generate(room: Room, agent: dict[str, Any], user_text: str) -> None:
             history=history,
             temperature=float(agent.get("temperature") or 0.85),
             persona=agent.get("persona") or "custom",
+            api_key=api_key,
         ):
             if room.stop.is_set():
                 stopped = True
@@ -223,7 +238,19 @@ async def _generate(room: Room, agent: dict[str, Any], user_text: str) -> None:
 async def chat_socket(websocket: WebSocket, agent_id: str) -> None:
     await websocket.accept()
 
-    agent = await asyncio.to_thread(db.get_agent, agent_id)
+    # Browsers cannot set headers on a WebSocket, so the bearer token rides in
+    # the query string instead.
+    token = websocket.query_params.get("token")
+    user = await asyncio.to_thread(auth.user_for_token, token)
+    if user is None:
+        await websocket.send_json(
+            {"type": "error", "code": "unauthorized",
+             "message": "Your session has expired. Please sign in again."}
+        )
+        await websocket.close(code=WS_UNAUTHORIZED)
+        return
+
+    agent = await asyncio.to_thread(db.get_agent, agent_id, user["id"])
     if agent is None:
         await websocket.send_json(
             {"type": "error", "code": "not_found", "message": "Unknown agent."}
@@ -293,8 +320,25 @@ async def chat_socket(websocket: WebSocket, agent_id: str) -> None:
                 })
                 continue
 
+            # Shared-key users get a small daily allowance; BYOK users do not.
+            if not auth.is_byok(user):
+                used = await asyncio.to_thread(db.daily_message_count, user["id"])
+                if used >= settings.shared_key_daily_messages:
+                    await websocket.send_json({
+                        "type": "error",
+                        "code": auth.QUOTA_MESSAGES,
+                        "message": (
+                            f"You have used all "
+                            f"{settings.shared_key_daily_messages} messages for "
+                            "today on the shared key. Add your own Gemini API "
+                            "key in Settings for unlimited messages."
+                        ),
+                        "quota": await asyncio.to_thread(auth.quota_snapshot, user),
+                    })
+                    continue
+
             # Re-read the agent: its prompt may have been edited since connect.
-            fresh = await asyncio.to_thread(db.get_agent, agent_id)
+            fresh = await asyncio.to_thread(db.get_agent, agent_id, user["id"])
             if fresh is None:
                 await websocket.send_json(
                     {"type": "error", "code": "not_found", "message": "Unknown agent."}
@@ -307,7 +351,16 @@ async def chat_socket(websocket: WebSocket, agent_id: str) -> None:
                 {"type": "user_message", "message": _public_message(saved)}
             )
 
-            room.task = asyncio.create_task(_generate(room, fresh, content))
+            if not auth.is_byok(user):
+                await asyncio.to_thread(db.record_daily_message, user["id"])
+                await websocket.send_json({
+                    "type": "quota",
+                    "quota": await asyncio.to_thread(auth.quota_snapshot, user),
+                })
+
+            room.task = asyncio.create_task(
+                _generate(room, fresh, content, user.get("gemini_api_key") or None)
+            )
 
     except WebSocketDisconnect:
         pass
