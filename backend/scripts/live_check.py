@@ -130,7 +130,7 @@ async def main(base_url: str) -> int:
             history = (await client.get(f"/api/agents/{agent['id']}/messages")).json()
             roles = [message["role"] for message in history["messages"]]
             report("stored", f"{history['total']} messages ({roles})")
-            check(roles == ["user", "assistant"], "both turns are stored in SQLite")
+            check(roles == ["user", "assistant"], "both turns are stored in PostgreSQL")
             check(
                 history["messages"][-1]["content"] == text,
                 "stored reply matches the streamed text",

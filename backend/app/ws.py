@@ -320,6 +320,14 @@ async def chat_socket(websocket: WebSocket, agent_id: str) -> None:
                 })
                 continue
 
+            # The account can change while this socket is open: the Settings
+            # dialog saves a BYOK key over REST, so re-read the user now. This
+            # makes a newly added key take effect immediately and stops BYOK
+            # accounts from being counted against the shared-key quota.
+            fresh_user = await asyncio.to_thread(db.get_user, user["id"])
+            if fresh_user is not None:
+                user = fresh_user
+
             # Shared-key users get a small daily allowance; BYOK users do not.
             if not auth.is_byok(user):
                 used = await asyncio.to_thread(db.daily_message_count, user["id"])

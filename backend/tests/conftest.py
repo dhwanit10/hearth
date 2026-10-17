@@ -1,21 +1,23 @@
 """Shared pytest fixtures.
 
 The environment is pinned *before* the app package is imported so the test run
-never touches the developer's real database and always exercises the offline
-demo engine (no network, no API key needed).
+never touches the developer's real database (a dedicated ``hearth_test`` database
+is used) and always exercises the offline demo engine (no network, no API key
+needed).
 """
 
 from __future__ import annotations
 
 import itertools
 import os
-import tempfile
 import uuid
-from pathlib import Path
 
-_TMP = Path(tempfile.mkdtemp(prefix="hearth-tests-"))
-
-os.environ["DATABASE_PATH"] = str(_TMP / "test.db")
+# Tests talk to their own database so the developer's data is never touched.
+# Override with TEST_DATABASE_URL for a different server/credentials.
+os.environ["DATABASE_URL"] = os.getenv(
+    "TEST_DATABASE_URL",
+    "postgresql+psycopg2://postgres:123456@localhost:5432/hearth_test",
+)
 os.environ["GEMINI_API_KEY"] = ""
 os.environ["CHAT_HISTORY_LIMIT"] = "12"
 os.environ["SHARED_KEY_MAX_AGENTS"] = "3"
@@ -23,9 +25,12 @@ os.environ["SHARED_KEY_DAILY_MESSAGES"] = "10"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import delete  # noqa: E402
 
 from app import db  # noqa: E402
 from app.main import app  # noqa: E402
+from app.models import Agent, Message, UsageDaily, User  # noqa: E402
+from app.models import Session as SessionModel  # noqa: E402
 
 # Every account gets a unique email so signups never collide within a run.
 _email_counter = itertools.count(1)
@@ -73,13 +78,12 @@ def offline_llm(monkeypatch):
 def clean_database():
     """Every test starts from an empty database."""
     db.init_db()
-    with db.get_connection() as conn:
-        conn.execute("DELETE FROM messages")
-        conn.execute("DELETE FROM agents")
-        conn.execute("DELETE FROM usage_daily")
-        conn.execute("DELETE FROM sessions")
-        conn.execute("DELETE FROM users")
-        conn.commit()
+    with db.session_scope() as session:
+        session.execute(delete(Message))
+        session.execute(delete(Agent))
+        session.execute(delete(UsageDaily))
+        session.execute(delete(SessionModel))
+        session.execute(delete(User))
     yield
 
 

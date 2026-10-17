@@ -402,6 +402,63 @@ def test_byok_requests_use_the_users_own_key(auth, user, make_agent, offline_llm
     assert offline_llm.instances[-1].api_key == "AIza-personal"
 
 
+def test_key_added_mid_session_is_used_and_stops_counting(auth, user, make_agent, offline_llm):
+    """Adding a key while the socket is open must take effect immediately.
+
+    The Settings dialog saves the key over REST; the already-open websocket used
+    to keep the stale user, so the key was ignored *and* every message kept
+    counting against the shared-key quota.
+    """
+    agent = make_agent(name="MidSession")
+
+    with auth.websocket_connect(ws_path(agent["id"], user)) as socket:
+        socket.receive_json()  # ready
+
+        # First turn runs on the shared key: it counts and echoes a quota frame.
+        socket.send_json({"type": "message", "content": "first"})
+        assert socket.receive_json()["type"] == "user_message"
+        assert socket.receive_json()["type"] == "quota"
+        collect_reply(socket)
+
+        # Add a BYOK key over REST without reopening the socket.
+        auth.patch("/api/auth/me", json={"gemini_api_key": "AIza-mid-session"})
+
+        # Second turn must use the fresh key and must not be counted.
+        socket.send_json({"type": "message", "content": "second"})
+        assert socket.receive_json()["type"] == "user_message"
+        collect_reply(socket)
+
+    assert offline_llm.instances[-1].api_key == "AIza-mid-session"
+    quota = auth.get("/api/auth/me").json()["user"]["quota"]
+    assert quota["unlimited"] is True
+    assert quota["messages_used_today"] == 1  # only the pre-key turn counted
+
+
+def test_key_removed_mid_session_resumes_the_shared_quota(auth, user, make_agent):
+    """Removing the key again puts the account back on the shared allowance."""
+    auth.patch("/api/auth/me", json={"gemini_api_key": "AIza-personal"})
+    agent = make_agent(name="Dropped")
+
+    with auth.websocket_connect(ws_path(agent["id"], user)) as socket:
+        socket.receive_json()
+
+        # On BYOK: no counting, no quota frame.
+        socket.send_json({"type": "message", "content": "byok turn"})
+        assert socket.receive_json()["type"] == "user_message"
+        collect_reply(socket)
+
+        # Clear the key over REST while the socket stays open.
+        auth.patch("/api/auth/me", json={"gemini_api_key": ""})
+
+        # Back on the shared key: the turn counts and a quota frame arrives.
+        socket.send_json({"type": "message", "content": "shared turn"})
+        assert socket.receive_json()["type"] == "user_message"
+        quota_frame = socket.receive_json()
+        assert quota_frame["type"] == "quota"
+        assert quota_frame["quota"]["messages_used_today"] == 1
+        collect_reply(socket)
+
+
 def test_engine_is_wired_with_the_configured_models(auth, user, make_agent, offline_llm):
     from app.config import settings
 

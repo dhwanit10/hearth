@@ -3,3 +3,6 @@ uvicorn[standard]>=0.37
 httpx>=0.28
 python-dotenv>=1.1
 websockets>=15.0
+SQLAlchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9

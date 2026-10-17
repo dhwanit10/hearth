@@ -271,7 +271,11 @@ class GeminiClient:
             detail = body.strip()[:300]
 
         if status_code in (401, 403):
-            hint = "The Gemini API key was rejected. Check GEMINI_API_KEY in backend/.env."
+            hint = (
+                "The Gemini API key was rejected. If you added your own key in "
+                "Settings, double-check it; otherwise check GEMINI_API_KEY in "
+                "backend/.env."
+            )
         elif status_code == 404:
             hint = (
                 f"The model '{model}' does not exist for this API version. Check "
