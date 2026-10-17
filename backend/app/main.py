@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
     db.init_db()
     status = llm_status()
     logger.info("Hearth %s starting", __version__)
-    logger.info("Database ready at %s", settings.database_path)
+    logger.info("Database ready: %s (PostgreSQL)", settings.database_name)
     if status["mode"] == "gemini":
         logger.info(
             "LLM: Gemini model=%s thinking=%s",
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Hearth API",
     description=(
-        "Companion chat backend: persistent conversation history in SQLite, "
+        "Companion chat backend: persistent conversation history in PostgreSQL, "
         "persona driven prompting, and token streaming over WebSockets."
     ),
     version=__version__,

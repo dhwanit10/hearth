@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+from sqlalchemy.engine import make_url
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -51,10 +52,21 @@ def _csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
-def _path(name: str, default: str) -> Path:
-    raw = _str(name) or default
-    path = Path(raw)
-    return path if path.is_absolute() else (BACKEND_DIR / path)
+def _database_url() -> str:
+    """Read ``DATABASE_URL`` and pin it to the psycopg2 driver.
+
+    SQLAlchemy understands a bare ``postgresql://...`` string, but which driver
+    it picks depends on the installed version. Normalising it to
+    ``postgresql+psycopg2://...`` keeps the app on the pinned dependency no
+    matter how the URL is written.
+    """
+    raw = _str(
+        "DATABASE_URL",
+        "postgresql+psycopg2://postgres:postgres@localhost:5432/hearth",
+    )
+    if raw.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + raw[len("postgresql://"):]
+    return raw
 
 
 @dataclass(frozen=True)
@@ -90,8 +102,8 @@ class Settings:
     session_ttl_days: int = field(
         default_factory=lambda: _int("SESSION_TTL_DAYS", 30)
     )
-    database_path: Path = field(
-        default_factory=lambda: _path("DATABASE_PATH", "data/hearth.db")
+    database_url: str = field(
+        default_factory=_database_url
     )
     cors_origins: tuple[str, ...] = field(
         default_factory=lambda: _csv(
@@ -110,6 +122,11 @@ class Settings:
     @property
     def llm_mode(self) -> str:
         return "gemini" if self.llm_configured else "demo"
+
+    @property
+    def database_name(self) -> str:
+        """Database name only (no host/credentials), for the health endpoint."""
+        return make_url(self.database_url).database or ""
 
 
 settings = Settings()

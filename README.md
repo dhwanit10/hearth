@@ -9,7 +9,7 @@ Warm, flat, and quiet by design: no shadows, no emoji, no blue.
 
 ```
 Hearth/
-├─ backend/     FastAPI + SQLite + Gemini, accounts + BYOK quota, streaming replies over WebSockets
+├─ backend/     FastAPI + PostgreSQL + Gemini, accounts + BYOK quota, streaming replies over WebSockets
 └─ frontend/    React + Vite, light and dark themes
 ```
 
@@ -33,7 +33,7 @@ Hearth/
 - **Random name or yours.** Creating a companion suggests names for the chosen
   archetype - shuffle until one fits, or type your own. Leave it blank and the
   server picks.
-- **Persistent history.** Every message is stored in SQLite. Close the tab,
+- **Persistent history.** Every message is stored in PostgreSQL. Close the tab,
   restart the machine, come back in a week: the conversation is waiting.
 - **Token streaming over WebSockets.** Replies appear word by word, and two
   browser tabs watching the same companion stay in sync.
@@ -43,7 +43,9 @@ Hearth/
 
 ## Quick start
 
-Two terminals. You need **Python 3.11+** and **Node 18+**.
+Two terminals. You need **Python 3.11+**, **Node 18+** and a running
+**PostgreSQL** server (create a database and set `DATABASE_URL` in
+`backend/.env`; the schema is created on first boot).
 
 **1. Backend**
 
@@ -52,7 +54,7 @@ cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1        # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-Copy-Item .env.example .env         # then add your GEMINI_API_KEY
+Copy-Item .env.example .env         # set DATABASE_URL, then add your GEMINI_API_KEY
 uvicorn app.main:app --reload
 ```
 
@@ -92,22 +94,22 @@ the signed-in user.
 ## How a reply is produced
 
 ```
-browser ──POST /api/auth/login──► FastAPI ──► users / sessions (SQLite)
+browser ──POST /api/auth/login──► FastAPI ──► users / sessions (PostgreSQL)
    │                                   ▲
-   └──POST /api/agents (bearer token)──┘──► agents / messages (SQLite)
+   └──POST /api/agents (bearer token)──┘──► agents / messages (PostgreSQL)
    │
    └──ws /ws/chat/{id}?token=…──► Hub room ──► build context (last N messages)
                                       │
                                       ├─► user key, else shared key, else demo
                                       │      chunks ──► {"type":"delta"} ──► browser
-                                      └─► save final message ──► SQLite
+                                      └─► save final message ──► PostgreSQL
 ```
 
 0. The client signs in and stores the bearer token; REST calls send it as an
    `Authorization` header and the websocket carries it in the query string.
 1. The client sends `{"type": "message", "content": "..."}` over the socket.
-2. The user turn is written to SQLite **first**, then broadcast to every listener
-   in that companion's room.
+2. The user turn is written to PostgreSQL **first**, then broadcast to every
+   listener in that companion's room.
 3. The last `CHAT_HISTORY_LIMIT` messages are replayed to Gemini as context,
    together with the companion's stored system prompt.
 4. Gemini streams SSE chunks; each becomes a `delta` frame.
@@ -135,7 +137,7 @@ cd frontend ; npm test                                       # 108 passed
 ```
 
 The backend suite drives the real ASGI app (including a websocket round trip and
-SQLite assertions). The frontend suite renders the actual React tree and includes
+PostgreSQL assertions). The frontend suite renders the actual React tree and includes
 a **palette guard** that parses every colour literal in the stylesheet and fails
 if any of them drifts out of the warm band - so "no blue, violet, purple, green
 or pink" is enforced by a test rather than by trust.
@@ -164,7 +166,7 @@ in each folder). The backend reads:
 | `SHARED_KEY_MAX_AGENTS` | `3` | Companions a shared-key user may create |
 | `SHARED_KEY_DAILY_MESSAGES` | `10` | User messages a shared-key user may send per UTC day |
 | `SESSION_TTL_DAYS` | `30` | Login session lifetime |
-| `DATABASE_PATH` | `data/hearth.db` | SQLite file |
+| `DATABASE_URL` | `postgresql+psycopg2://postgres:postgres@localhost:5432/hearth` | SQLAlchemy/psycopg2 connection string |
 | `CORS_ORIGINS` | `http://localhost:5173,...` | Allowed browser origins |
 
 The frontend reads `VITE_API_BASE`, `VITE_WS_BASE` (both empty = same origin via

@@ -228,7 +228,7 @@ async def health() -> HealthOut:
     return HealthOut(
         app="Hearth",
         version=__version__,
-        database=str(settings.database_path.name),
+        database=settings.database_name,
         llm=llm_status(),
     )
 

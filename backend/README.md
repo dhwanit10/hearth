@@ -1,15 +1,20 @@
 # Hearth - backend
 
 FastAPI service that owns companions, conversations and the Gemini connection.
-Streams replies to the browser over WebSockets and keeps everything in SQLite.
+Streams replies to the browser over WebSockets and keeps everything in PostgreSQL
+(via SQLAlchemy, with Alembic for schema migrations).
 
 ## Setup
+
+You need a running **PostgreSQL** server. Create a database (e.g. `hearth`) and
+point `DATABASE_URL` at it in `.env` - the schema is created automatically on
+first boot.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1       # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-Copy-Item .env.example .env        # add GEMINI_API_KEY (optional, see below)
+Copy-Item .env.example .env        # set DATABASE_URL, add GEMINI_API_KEY (optional)
 uvicorn app.main:app --reload
 ```
 
@@ -44,7 +49,7 @@ variables win). See `.env.example` for the full list with commentary.
 | `SHARED_KEY_MAX_AGENTS` | `3` | Companions a shared-key user may create |
 | `SHARED_KEY_DAILY_MESSAGES` | `10` | User messages a shared-key user may send per UTC day |
 | `SESSION_TTL_DAYS` | `30` | Login session lifetime |
-| `DATABASE_PATH` | `data/hearth.db` | Relative to `backend/` |
+| `DATABASE_URL` | `postgresql+psycopg2://postgres:postgres@localhost:5432/hearth` | SQLAlchemy connection string (psycopg2 driver) |
 | `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma separated |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Used by `python -m app` |
 
@@ -58,8 +63,8 @@ string (`/ws/chat/{id}?token=...`), because browsers cannot set headers on a
 WebSocket handshake.
 
 Users may store their **own** Gemini API key ("bring your own key"). It is kept
-in the `users` table (a local SQLite file), used only for that user's requests,
-and never returned to the client. The quota rules are:
+in the `users` table (the PostgreSQL database), used only for that user's
+requests, and never returned to the client. The quota rules are:
 
 - **Own key (BYOK):** unlimited companions, unlimited messages.
 - **Shared key:** `SHARED_KEY_MAX_AGENTS` companions and
@@ -196,12 +201,16 @@ version-pin or churn.
 
 ## Database
 
-SQLite via stdlib `sqlite3`, opened per call (WAL, `foreign_keys=ON`,
-`busy_timeout=5000`) and run inside `asyncio.to_thread` so the event loop never
-blocks on disk. `init_db()` runs on startup and only issues
-`CREATE TABLE IF NOT EXISTS`.
+PostgreSQL, accessed through SQLAlchemy 2.x ORM models (`app/models.py`) and the
+synchronous helpers in `app/db.py`. Those helpers keep the same signatures the
+API already used and run inside `asyncio.to_thread`, so the event loop never
+blocks on a query. The engine is a normal connection pool with `pool_pre_ping`,
+which recycles connections dropped by Postgres instead of failing a request.
 
-```sql
+Timestamps are stored as ISO-8601 UTC text (the same format the app always
+wrote), so ordering and comparison behave exactly as before.
+
+```text
 users       (id, email UNIQUE, username, password_hash, gemini_api_key,
              created_at, updated_at)
 sessions    (token PK, user_id → users.id ON DELETE CASCADE,
@@ -219,22 +228,48 @@ messages    (id, agent_id → agents.id ON DELETE CASCADE, role, content,
 Deleting a companion cascades to its messages and closes any live socket.
 Deleting a user cascades to their companions, sessions and usage rows.
 
-`init_db()` runs on startup, issues `CREATE TABLE IF NOT EXISTS`, and then
-patches older databases (currently by adding `agents.user_id`) so an existing
-file upgrades in place.
+### Migrations (Alembic)
+
+The schema is owned by [Alembic](https://alembic.sqlalchemy.org/). `init_db()`
+runs `upgrade head` on startup, so a fresh database - or a new revision - is
+applied automatically; there is no manual SQL step.
+
+To change the schema:
+
+```powershell
+# 1. edit app/models.py, then generate a migration from the model diff
+.\.venv\Scripts\alembic.exe revision --autogenerate -m "add something"
+
+# 2. review migrations/versions/<rev>_add_something.py, then apply it
+.\.venv\Scripts\alembic.exe upgrade head
+
+# move to a specific revision / roll one back
+.\.venv\Scripts\alembic.exe upgrade <rev>
+.\.venv\Scripts\alembic.exe downgrade -1
+```
+
+`migrations/env.py` reads `DATABASE_URL` from the app config and the metadata
+from `app.models`, so the app and Alembic can never drift apart. Create the
+database once before the first run:
+
+```powershell
+createdb hearth            # or: CREATE DATABASE hearth;
+```
 
 ## Tests
 
 ```powershell
 pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest tests -q          # 30 tests
+.\.venv\Scripts\python.exe -m pytest tests -q          # 38 tests
 .\.venv\Scripts\python.exe scripts\live_check.py       # against a running server
 ```
 
-`tests/conftest.py` pins a temporary database and forces the offline demo engine
-**before** importing the app, so the suite never touches your real data and never
-reaches the network - even the BYOK paths run against a stand-in Gemini client
-that records the key it was handed. Coverage includes signup/login/logout, token
+`tests/conftest.py` points `DATABASE_URL` at a dedicated `hearth_test` database
+(and forces the offline demo engine) **before** importing the app, so the suite
+never touches your real data and never reaches the network - even the BYOK paths
+run against a stand-in Gemini client that records the key it was handed. Create
+the test database once (`CREATE DATABASE hearth_test;`) or point
+`TEST_DATABASE_URL` at your own. Coverage includes signup/login/logout, token
 enforcement on REST and WebSocket, per-user data isolation, first-signup claiming
 of legacy companions, the companion and daily-message quotas (and their removal
 via BYOK), agent CRUD, prompt rebuilding on rename, name suggestions avoiding
