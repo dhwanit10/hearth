@@ -24,7 +24,18 @@ logger = logging.getLogger("hearth")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.init_db()
+    try:
+        db.init_db()
+    except Exception as exc:  # noqa: BLE001 - re-raised after a clear log line
+        logger.error(
+            "Could not connect to / migrate PostgreSQL at %s. Check DATABASE_URL "
+            "in backend/.env: the host, port, database name and user/password, "
+            "and add '?sslmode=require' if your provider needs TLS. "
+            "Underlying error: %s",
+            settings.database_name or "the configured database",
+            exc,
+        )
+        raise
     status = llm_status()
     logger.info("Hearth %s starting", __version__)
     logger.info("Database ready: %s (PostgreSQL)", settings.database_name)

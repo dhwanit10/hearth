@@ -56,16 +56,18 @@ def _database_url() -> str:
     """Read ``DATABASE_URL`` and pin it to the psycopg2 driver.
 
     SQLAlchemy understands a bare ``postgresql://...`` string, but which driver
-    it picks depends on the installed version. Normalising it to
-    ``postgresql+psycopg2://...`` keeps the app on the pinned dependency no
-    matter how the URL is written.
+    it picks depends on the installed version. Cloud providers sometimes hand
+    out the legacy ``postgres://`` scheme, which SQLAlchemy 2.x does not know at
+    all. Normalising both to ``postgresql+psycopg2://...`` keeps the app on the
+    pinned dependency no matter how the URL is written.
     """
     raw = _str(
         "DATABASE_URL",
         "postgresql+psycopg2://postgres:postgres@localhost:5432/hearth",
     )
-    if raw.startswith("postgresql://"):
-        return "postgresql+psycopg2://" + raw[len("postgresql://"):]
+    for scheme in ("postgresql://", "postgres://"):
+        if raw.startswith(scheme):
+            return "postgresql+psycopg2://" + raw[len(scheme):]
     return raw
 
 

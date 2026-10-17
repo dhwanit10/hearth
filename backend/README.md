@@ -18,6 +18,44 @@ Copy-Item .env.example .env        # set DATABASE_URL, add GEMINI_API_KEY (optio
 uvicorn app.main:app --reload
 ```
 
+The schema (all tables) is created automatically on the first boot via Alembic,
+so an empty database just works. If the server exits immediately instead, it
+could not reach the database - see the `DATABASE_URL` notes below.
+
+### Connecting to a cloud / hosted PostgreSQL
+
+`.env` accepts any of these forms; the bare ones are normalised to the pinned
+psycopg2 driver for you:
+
+```dotenv
+DATABASE_URL=postgresql://user:password@host:5432/dbname
+DATABASE_URL=postgres://user:password@host:5432/dbname
+DATABASE_URL=postgresql+psycopg2://user:password@host:5432/dbname
+```
+
+Most hosted providers require TLS and will refuse a plain connection with
+`SSL connection is required` / `no pg_hba.conf entry` - append
+`?sslmode=require`:
+
+```dotenv
+DATABASE_URL=postgresql://user:password@host:5432/dbname?sslmode=require
+```
+
+Other common causes of a startup failure:
+
+- **Special characters in the password** (`@`, `:`, `/`, `#`, `?`) must be
+  percent-encoded, e.g. `p@ss` → `p%40ss`.
+- **The database itself must exist** (cloud panels create it for you); the
+  connection string points at an existing database.
+- **Wrong host/port** - some providers use a non-5432 pooler port.
+
+To create the schema without starting the server (or to check the connection),
+run migrations directly - they read the same `DATABASE_URL`:
+
+```powershell
+.\.venv\Scripts\alembic.exe upgrade head
+```
+
 - API root: <http://127.0.0.1:8000>
 - Interactive docs: <http://127.0.0.1:8000/docs>
 - Health + LLM status: <http://127.0.0.1:8000/api/health>
