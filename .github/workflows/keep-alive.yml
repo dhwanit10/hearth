@@ -1,0 +1,63 @@
+name: Backend keep-alive
+
+# Render's free web services sleep after ~15 minutes without inbound traffic.
+# This workflow pings the public health endpoint every 10 minutes so the service
+# stays warm even when nobody has the site open (a static frontend page can only
+# ping while a browser tab is actually open, so the pinger has to live here).
+#
+# Setup (once):
+#   1. GitHub -> Settings -> Secrets and variables -> Actions -> Variables
+#   2. New variable:  Name = BACKEND_URL   Value = https://<your-service>.onrender.com
+#      (no trailing slash)
+#   Prefer to hardcode it? Just edit the fallback value below.
+#
+# Heads-up: GitHub disables scheduled workflows after 60 days without any repo
+# activity. Keep committing, or use a free uptime monitor (UptimeRobot,
+# cron-job.org) as a backstop.
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub can delay scheduled runs by a few minutes; for a
+    # 15-minute idle timeout that is normally fine. Use "*/5 * * * *" if you
+    # want more margin.
+    - cron: "*/10 * * * *"
+  # Lets you trigger it by hand from the Actions tab to test the setup.
+  workflow_dispatch:
+
+concurrency:
+  group: backend-keep-alive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Ping /api/health
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Hit the backend health endpoint
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL || 'https://your-backend.onrender.com' }}
+        run: |
+          set -uo pipefail
+          url="${BACKEND_URL%/}/api/health"
+          echo "Target: $url"
+
+          # A sleeping free instance wakes on the first request, which can take
+          # ~30-60s; --max-time waits for it, and we retry in case the wake-up
+          # surfaces a transient 502/503.
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' \
+              --max-time 90 "$url" || true)
+            echo "Attempt ${attempt}: HTTP ${code}"
+            if [ "${code}" = "200" ]; then
+              echo "Backend is awake:"
+              cat /tmp/health.json || true
+              echo
+              exit 0
+            fi
+            sleep 20
+          done
+
+          echo "::error::Backend health check failed (last HTTP ${code}). Check BACKEND_URL and that the service is up."
+          exit 1

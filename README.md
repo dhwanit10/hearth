@@ -150,6 +150,27 @@ cd backend
 .\.venv\Scripts\python.exe scripts\live_check.py
 ```
 
+## Deployment: keeping a free Render backend awake
+
+Render's free web services sleep after ~15 minutes without traffic, and a static
+frontend cannot prevent that on its own — browser code only runs while a tab is
+open. This repo ships a GitHub Actions workflow
+([`.github/workflows/keep-alive.yml`](.github/workflows/keep-alive.yml)) that
+pings `/api/health` every 10 minutes, 24/7, with no browser involved.
+
+Point it at your backend once:
+
+1. GitHub → **Settings → Secrets and variables → Actions → Variables**.
+2. Add a variable named `BACKEND_URL` with your service URL, e.g.
+   `https://hearth-backend.onrender.com` (no trailing slash).
+3. Open the **Actions** tab → **Backend keep-alive** → **Run workflow** to
+   confirm it passes.
+
+`/api/health` is public, so no secret or token is needed. If the schedule is ever
+still too slow, change the cron to `*/5 * * * *`; and note GitHub disables
+scheduled workflows after 60 days without repo activity, so a free uptime monitor
+(UptimeRobot, cron-job.org) also pointed at the same URL makes a good backstop.
+
 ## Configuration
 
 Both halves are configured through `.env` files (copied from the `.env.example`
